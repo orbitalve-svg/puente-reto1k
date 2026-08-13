@@ -257,19 +257,31 @@ p.sub {
 
   var ua = navigator.userAgent || '';
 
-  // TikTok usa el WebView de ByteDance; su UA varia mucho por region
-  // y version, por eso se comprueban varias huellas.
+  var esIOS = /iPad|iPhone|iPod/i.test(ua) ||
+              // iPad con iPadOS se identifica como Mac con pantalla tactil
+              (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1);
+  var esAndroid = /Android/i.test(ua);
+
+  // --- Huellas explicitas de apps conocidas ---
   var esTikTok    = /BytedanceWebview|musical_ly|Bytedance|TikTok|trill/i.test(ua);
   var esInstagram = /Instagram/i.test(ua);
   var esFacebook  = /FBAN|FBAV|FB_IAB|FBIOS/i.test(ua);
   var esOtroWebview = /Line\/|MicroMessenger|Twitter|Snapchat|LinkedInApp|Pinterest/i.test(ua);
 
-  var enApp = esTikTok || esInstagram || esFacebook || esOtroWebview;
+  // --- Deteccion por ausencia de navegador real ---
+  // El navegador de TikTok en iPhone NO deja huella en muchas versiones:
+  // su UA es identica a la de Safari menos "Version/" y "Safari/". Por eso
+  // no basta con buscar apps; hay que comprobar si esto ES un navegador.
+  // Safari real:  ... Version/17.5 Mobile/15E148 Safari/604.1
+  // WebView:      ... Mobile/15E148            (sin Version/ ni Safari/)
+  var navegadorRealIOS = /CriOS|FxiOS|EdgiOS|OPiOS/i.test(ua) ||
+                         (/Safari\//i.test(ua) && /Version\//i.test(ua));
+  // En Android los WebView se marcan con "; wv)" dentro del UA
+  var webviewAndroid = /;\s*wv\)/i.test(ua);
 
-  var esIOS = /iPad|iPhone|iPod/i.test(ua) ||
-              // iPad con iPadOS se identifica como Mac con pantalla tactil
-              (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1);
-  var esAndroid = /Android/i.test(ua);
+  var enApp = esTikTok || esInstagram || esFacebook || esOtroWebview ||
+              (esIOS && !navegadorRealIOS) ||
+              (esAndroid && webviewAndroid);
 
   var $ = function (id) { return document.getElementById(id); };
 
@@ -297,11 +309,22 @@ p.sub {
   var esGrupo = /chat\.whatsapp\.com/i.test(DESTINO);
   var telefono = (DESTINO.match(/wa\.me\/(\d+)/i) || [])[1] || '';
 
-  // URL final: al numero se le engancha el mensaje pre-escrito
+  var TXT = MENSAJE ? encodeURIComponent(MENSAJE) : '';
+
+  // URL_FINAL -> version web (wa.me). Es la que se copia y la que lleva el
+  // boton: funciona siempre, aunque no tenga WhatsApp instalado.
   var URL_FINAL = DESTINO;
-  if (!esGrupo && telefono && MENSAJE) {
-    URL_FINAL = 'https://wa.me/' + telefono + '?text=' + encodeURIComponent(MENSAJE);
+  if (!esGrupo && telefono && TXT) {
+    URL_FINAL = 'https://wa.me/' + telefono + '?text=' + TXT;
   }
+
+  // URL_APP -> esquema propio de WhatsApp. Abre la app DIRECTO.
+  // wa.me primero pasa por api.whatsapp.com, que en iPhone se queda en una
+  // pagina intermedia con un boton "Abrir aplicacion" que dentro de un
+  // navegador de app no funciona. Este esquema se salta ese paso.
+  var URL_APP = esGrupo
+    ? DESTINO.replace(/^https?:\/\/chat\.whatsapp\.com\//i, 'whatsapp://chat?code=')
+    : 'whatsapp://send?phone=' + telefono + (TXT ? '&text=' + TXT : '');
 
   // Textos segun el caso
   var COPY = esGrupo
@@ -337,10 +360,51 @@ p.sub {
   if (txt) txt.textContent = URL_FINAL.split('?')[0].replace(/^https:\/\//, '');
 
   /* ==========================================================
-     CASO 1 -- navegador normal: derecho a WhatsApp
+     MODO DIAGNOSTICO -- anadir ?debug=1 al final de la URL.
+     Muestra que detecto y no redirige a ningun lado. Sirve para saber
+     por que fallo en un telefono concreto sin tener que adivinar.
+     ========================================================== */
+  if (/[?&]debug=1/.test(window.location.search)) {
+    var caja = document.querySelector('.caja');
+    var d = document.createElement('div');
+    d.style.cssText = 'text-align:left;font-size:11px;line-height:1.6;word-break:break-all;' +
+      'background:rgba(0,0,0,.5);padding:14px;border-radius:12px;margin-top:16px;color:#F4F1EA';
+    d.innerHTML =
+      '<b>Diagnostico</b><br><br>' +
+      '<b>Sistema:</b> ' + (esIOS ? 'iOS' : (esAndroid ? 'Android' : 'otro')) + '<br>' +
+      '<b>Dentro de una app:</b> ' + (enApp ? 'SI' : 'NO') + '<br>' +
+      '<b>Navegador real (iOS):</b> ' + (navegadorRealIOS ? 'SI' : 'NO') + '<br>' +
+      '<b>WebView Android:</b> ' + (webviewAndroid ? 'SI' : 'NO') + '<br>' +
+      '<b>Huella TikTok:</b> ' + (esTikTok ? 'SI' : 'NO') + '<br><br>' +
+      '<b>Ruta que tomaria:</b> ' +
+        (!enApp ? 'redirigir a WhatsApp' : (esAndroid ? 'intent:// + plan B' : 'esquema + instrucciones')) +
+      '<br><br><b>URL app:</b> ' + URL_APP +
+      '<br><br><b>User-Agent:</b><br>' + ua;
+    mostrar('vista-salir');
+    if (caja) caja.appendChild(d);
+    return;
+  }
+
+  /* Marca si conseguimos salir de la pagina: si el sistema abre la app,
+     el documento se oculta. Sirve para no disparar planes B innecesarios. */
+  var saltoOk = false;
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) saltoOk = true;
+  });
+  window.addEventListener('pagehide', function () { saltoOk = true; });
+
+  /* ==========================================================
+     CASO 1 -- navegador normal (Safari, Chrome...)
+     Primero el esquema directo, que abre la app sin escalas.
+     Si en 1,2 s seguimos aqui (no tiene WhatsApp, o el esquema fue
+     bloqueado), se cae a la version web de wa.me.
      ========================================================== */
   if (!enApp) {
-    window.location.replace(URL_FINAL);
+    try { window.location.href = URL_APP; } catch (e) {}
+    window.setTimeout(function () {
+      if (saltoOk) return;
+      window.location.replace(URL_FINAL);
+    }, 1200);
     return;
   }
 
@@ -362,13 +426,6 @@ p.sub {
                 '#Intent;scheme=https;package=com.whatsapp;end';
     }
 
-    // Si el salto funciona, la pagina se oculta: cancelamos el plan B.
-    var saltoOk = false;
-    document.addEventListener('visibilitychange', function () {
-      if (document.hidden) saltoOk = true;
-    });
-    window.addEventListener('pagehide', function () { saltoOk = true; });
-
     try { window.location.href = intento; } catch (e) {}
 
     // Plan B: si en 2 s seguimos aqui, el intent no prospero.
@@ -382,17 +439,22 @@ p.sub {
   }
 
   /* ==========================================================
-     CASO 3 -- iOS dentro de una app:
-     los universal links NO disparan dentro de un WKWebView, asi que
-     no hay salto automatico fiable. Se guia al usuario a salir.
+     CASO 3 -- iOS dentro de una app.
+     Los universal links NO disparan dentro de un WKWebView, pero el
+     esquema whatsapp:// SI funciona en algunas versiones del navegador
+     de TikTok. Se intenta y, si en 1,5 s seguimos aqui, se guia a salir.
      ========================================================== */
-  mostrar('vista-salir');
+  try { window.location.href = URL_APP; } catch (e) {}
 
-  if (!esIOS) {
-    // Escritorio u otro sistema dentro de un webview raro
-    $('motivo').textContent =
-      'Este navegador no puede abrir WhatsApp directamente. Abre el enlace en tu navegador normal.';
-  }
+  window.setTimeout(function () {
+    if (saltoOk) return;
+    mostrar('vista-salir');
+    if (!esIOS) {
+      // Escritorio u otro sistema dentro de un webview raro
+      $('motivo').textContent =
+        'Este navegador no puede abrir WhatsApp directamente. Abre el enlace en tu navegador normal.';
+    }
+  }, 1500);
 
   /* ==========================================================
      Copiar el enlace -- la salida que nunca falla
